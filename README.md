@@ -1,28 +1,60 @@
 # Outdoor Gear Tracker
 
-A price-comparison web app for outdoor gear. Enter a product and the app scrapes
-retailer listings, then returns matching products and their prices in one place.
+A price-comparison web app for outdoor gear. Search for a product and the app
+scrapes multiple outdoor retailers, then returns the **best (lowest) available
+price** along with a full comparison of every match.
 
-Built with **FastAPI**, **SQLAlchemy**, and **BeautifulSoup / Playwright** for scraping.
+Built with **FastAPI**, **SQLAlchemy**, and **requests** for scraping.
 
 ---
 
 ## Features
 
-- 🔎 **Search** for gear from a simple web UI and get results from multiple sources
-- 🕸️ **Pluggable scrapers** — each retailer is an isolated module behind a common interface
-- 🗄️ **Persistence** — scraped products are stored in SQLite via SQLAlchemy models
-- 🔌 **JSON API** — the same search is available programmatically at `/api/search`
+- 🏷️ **Best-price finder** — search a product, get the lowest in-stock price and where to buy it
+- 📊 **Full comparison** — every matching listing across stores, cheapest first
+- 🕸️ **Real scraping** — live products, prices, and stock from actual outdoor stores
+- 🧩 **Pluggable scrapers** — adding a store is a one-line change
+- 🔌 **JSON API** — the same result is available programmatically at `/api/search`
+- 🗄️ **Persistence** — scraped products can be stored in SQLite via SQLAlchemy
 
 ---
 
 ## Tech Stack
 
-| Layer      | Tooling                                   |
-| ---------- | ----------------------------------------- |
-| Web / API  | FastAPI, Uvicorn                          |
-| Scraping   | requests + BeautifulSoup, Playwright      |
-| Data       | SQLAlchemy ORM, SQLite                    |
+| Layer      | Tooling                    |
+| ---------- | -------------------------- |
+| Web / API  | FastAPI, Uvicorn           |
+| Scraping   | requests (Shopify feeds)   |
+| Data       | SQLAlchemy ORM, SQLite     |
+
+---
+
+## How the scraper works
+
+Outdoor retailers commonly run their storefronts on **Shopify**, which exposes a
+public predictive-search endpoint at `/search/suggest.json`. `scrapers/shopify.py`
+queries that endpoint per store and normalizes each match into
+`{store, product, price, price_display, url, available}`. Searching server-side
+(rather than downloading a whole catalog) is fast and works identically on small
+brand-direct shops and large multi-brand retailers.
+
+Stores are queried **in parallel** (one request each), so a search across all of
+them takes about as long as the single slowest store (~0.5s), not the sum.
+
+Stores currently tracked (all real):
+
+- **Multi-brand retailers** — App Outdoors, Outdoor Gear Exchange, OmcGear, Tahoe
+  Mountain Sports, Garage Grown Gear, Outdoorplay, Feathered Friends. Between them
+  they carry mainstream brands (Osprey, Arc'teryx, Patagonia, Marmot, Columbia,
+  Black Diamond…), so the same product can be compared across stores.
+- **Brand-direct shops** — Hyperlite Mountain Gear, Gossamer Gear, Sea to Summit
+  (their own gear only).
+
+> **Design note:** big retailers like Amazon, REI, and Backcountry actively block
+> scrapers (Backcountry serves an empty page to automated browsers). Rather than fight
+> that, the tracker targets Shopify stores whose search endpoint is openly accessible —
+> a more honest and maintainable foundation. Adding another store is a one-line change
+> in `manager.py`.
 
 ---
 
@@ -34,25 +66,19 @@ outdoor-gear-tracker/
 ├── database.py               # SQLAlchemy engine + session factory
 ├── models.py                 # Product ORM model
 ├── create_db.py              # Creates the SQLite schema
-├── scrapers/                 # One module per source, plus a manager that runs them all
-│   ├── manager.py            #   scrape_all() — aggregates every scraper
-│   ├── books.py              #   demo scraper (books.toscrape.com)
-│   ├── outdoor.py            #   demo scraper (books.toscrape.com)
-│   └── backcountry.py        #   Playwright-based scraper (WIP)
+├── scrapers/
+│   ├── manager.py            # scrape_all() — runs every registered store, aggregates results
+│   └── shopify.py            # generic scraper for Shopify-backed stores
 ├── services/
-│   └── product_search.py     # search_product() — scrapes then filters by query
+│   └── product_search.py     # search_product() + find_best_price()
 └── requirements.txt
 ```
-
-> **Note:** `books.py` / `outdoor.py` currently scrape [books.toscrape.com](https://books.toscrape.com),
-> a public sandbox built for practicing scraping. They act as stand-ins for real
-> retailer scrapers while the scraping pipeline is being built out.
 
 ---
 
 ## Getting Started
 
-### 1. Clone and set up a virtual environment
+**Requirements:** Python 3.9+ and an internet connection (searches scrape stores live).
 
 ```bash
 git clone <your-repo-url>
@@ -60,40 +86,62 @@ cd outdoor-gear-tracker
 
 python3 -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
-
 pip install -r requirements.txt
-playwright install chromium     # only needed for the Backcountry scraper
-```
 
-### 2. Create the database
-
-```bash
-python create_db.py
-```
-
-### 3. Run the app
-
-```bash
 uvicorn app:app --reload
 ```
 
-Open <http://127.0.0.1:8000> and search for gear.
+Open <http://127.0.0.1:8000> and search for a product. Specific product names work
+best (e.g. `Osprey Atmos`, `Junction`, `UltaMid`, `Telos`); broad category words
+(`tent`) return the cheapest matching item, which may be an accessory.
+
+Two runnable demo scripts are included:
+
+```bash
+python demo_search.py       # print the best price for a sample query
+
+python create_db.py         # create the SQLite schema
+python demo_save_to_db.py   # scrape a query and save the results to the database
+```
 
 ---
 
 ## API
 
-`GET /api/search?product=<query>` returns JSON:
+`GET /api/search?product=<query>` returns the best price plus the full comparison:
 
 ```bash
-curl "http://127.0.0.1:8000/api/search?product=jacket"
+curl "http://127.0.0.1:8000/api/search?product=osprey%20atmos"
 ```
 
 ```json
 {
-  "product": "jacket",
+  "query": "osprey atmos",
+  "best": {
+    "store": "App Outdoors",
+    "product": "Men's Atmos AG LT 65 Backpack",
+    "price": 290.0,
+    "price_display": "$290.00",
+    "url": "https://appoutdoors.com/products/atmos-ag-lt-65",
+    "available": true
+  },
   "results": [
-    { "store": "Outdoor Demo", "product": "A Light in the Attic", "price": "£51.77" }
+    {
+      "store": "App Outdoors",
+      "product": "Men's Atmos AG LT 65 Backpack",
+      "price": 290.0,
+      "price_display": "$290.00",
+      "url": "https://appoutdoors.com/products/atmos-ag-lt-65",
+      "available": true
+    },
+    {
+      "store": "App Outdoors",
+      "product": "Men's Atmos AG LT 50 Backpack",
+      "price": 300.0,
+      "price_display": "$300.00",
+      "url": "https://appoutdoors.com/products/atmos-ag-lt-50",
+      "available": true
+    }
   ]
 }
 ```
@@ -103,32 +151,30 @@ curl "http://127.0.0.1:8000/api/search?product=jacket"
 ## How It Works
 
 1. A request hits `/search` (HTML) or `/api/search` (JSON).
-2. `services/product_search.py` calls `scrapers/manager.py::scrape_all()`, which runs
-   every registered scraper and aggregates the results.
-3. Results are filtered against the search term and returned to the caller.
-4. `test_scraper.py` demonstrates persisting scraped products to SQLite via the `Product` model.
+2. `services/product_search.py::find_best_price()` calls `scrapers/manager.py::scrape_all(query=...)`,
+   which runs each store scraper and aggregates matches.
+3. Matches are sorted so in-stock items rank first, then by ascending price — so the
+   first result is the best price.
+4. The best price is highlighted and the full comparison is returned.
 
-Adding a new retailer is intentionally small: write a `scrape_<store>()` function that
-returns `{"store", "product", "price"}` dicts, then register it in `manager.py`.
+Adding a new Shopify retailer is one line in `STORES` in `manager.py`:
+
+```python
+STORES = [
+    ("appoutdoors.com", "App Outdoors"),
+    ("gearx.com", "Outdoor Gear Exchange"),
+    ("omcgear.com", "OmcGear"),
+    # …seven more…
+    # ("your-store.com", "Your Store"),
+]
+```
 
 ---
 
 ## Roadmap
 
-- [ ] Finish the Playwright-based Backcountry scraper (parse title + price)
-- [ ] Swap the demo scrapers for real outdoor retailers (REI, Backcountry, etc.)
+- [ ] De-duplicate the *same* product across multi-brand retailers and rank by best price
 - [ ] Cache scrape results in the database instead of scraping on every request
-- [ ] Add automated tests (pytest) around scrapers and the search service
+- [ ] Add more retailers (and non-Shopify stores via dedicated scrapers)
+- [ ] Add automated tests (pytest) around the scrapers and search service
 - [ ] Price history + drop alerts
-
----
-
-## Testing / Scripts
-
-Handy scripts used during development:
-
-```bash
-python test_search.py       # run a search end to end
-python test_scraper.py      # scrape and persist to the database
-python test_backcountry.py  # exercise the Playwright scraper
-```
